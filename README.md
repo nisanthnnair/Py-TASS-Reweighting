@@ -1,4 +1,4 @@
-# `tass_reweight.py` — User Manual
+# `Py-TASS-Reweighting` — User Manual
 
 Multi-window **TASS** (Temperature-Accelerated Sliced Sampling) reweighting and
 free-energy reconstruction from PLUMED outputs.
