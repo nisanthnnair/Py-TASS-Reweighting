@@ -1,12 +1,18 @@
-# `Py-TASS-Reweighting` — User Manual
+# `tass_reweight.py` — User Manual
 
 Multi-window **TASS** (Temperature-Accelerated Sliced Sampling) reweighting and
 free-energy reconstruction from PLUMED outputs.
 
 `tass_reweight.py` reads the simulation parameters directly from each window's
 `plumed.dat`, computes the metadynamics reweighting factors (`c(t)` and
-`V_bias`), and stitches the umbrella windows into a 1D free-energy profile and an
-optional 2D free-energy surface.
+`V_bias`), and stitches the umbrella windows into a 1D free-energy profile
+`F(CV1)` and an optional 2D free-energy surface `F(CV1, CV_N)`.
+
+CVs are identified by their **PLUMED names** (for example `phi1`, `psi2`), not
+by a global column index. Local indexes may differ from window to window; the
+umbrella CV must be the same named CV in every window. Orthogonal metadynamics
+CVs may differ per window, or be absent. Reweighting always uses **all** metad
+CVs declared in that window's `plumed.dat`.
 
 ---
 
@@ -50,7 +56,7 @@ Conventions: energies in **kJ/mol** (`kB = 8.314472e-3 kJ/mol/K`); periodic CVs
 
 ### 3.1 Directory layout
 
-One folder per umbrella window, each holding the three PLUMED outputs:
+One folder per umbrella window, each holding the PLUMED outputs:
 
 ```
 <root>/
@@ -58,7 +64,7 @@ One folder per umbrella window, each holding the three PLUMED outputs:
 ├── W1/
 │   ├── plumed.dat
 │   ├── COLVAR
-│   └── HILLS
+│   └── HILLS          # only if that window has METAD
 ├── W2/
 │   ├── plumed.dat
 │   ├── COLVAR
@@ -77,8 +83,8 @@ them per window from `plumed.dat`:
 |----------|-----------------------------|
 | `ncv`, CV names, `iwrap` (TORSION→1) | the `name: TYPE ...` CV declarations |
 | `TEMP` (the temperature TASS uses) | `EXTENDED_LAGRANGIAN` |
-| `icv_metad` (which CV has MetaD), `w_hill` (PACE), `BIASFACTOR` | `METAD` / `METADYNAMICS` (optional) |
-| `icv_restraint` (which CV is restrained), `kappa_restraint` (KAPPA), `restraint_at` (AT) | `RESTRAINT` |
+| which CVs carry MetaD, `w_hill` (PACE), `BIASFACTOR` | `METAD` / `METADYNAMICS` (optional) |
+| which CV is restrained, `kappa_restraint` (KAPPA), `restraint_at` (AT) | `RESTRAINT` |
 | `w_cv` (STRIDE) and the COLVAR column order | `PRINT ... FILE=COLVAR` |
 
 COLVAR column layout implied by the `PRINT` line: column `0` = time, column
@@ -90,19 +96,26 @@ present but has no `TEMP`, the parser prints a warning (otherwise harmless).
 
 **The `METAD` action is optional.** A window whose `plumed.dat` has no `METAD`
 needs no `HILLS` and produces no `ct.dat` / `vbias.dat`; its reweighting weight
-is `1` for every frame (equivalent to `V_bias = 0`, `c(t) = 0`).
+is `1` for every frame (equivalent to `V_bias = 0`, `c(t) = 0`). If a window
+*does* have metadynamics, **all** of its metad CVs enter `c(t)` and `V_bias`.
 
-**Per-window layout:** `ncv`, `iwrap`, `icv_restraint` and the restraint CV index
-`cv1` are read independently from each window's `plumed.dat` and may differ
-between windows. Within a window, `cv1` is the 0-based index of the CV carrying
-the umbrella `RESTRAINT` (the entry of `icv_restraint` equal to 1). `icv_metad`
-may also differ per window.
+**CV identity is by PLUMED name.** `ncv`, local indexes, and which CVs carry
+metadynamics are read independently from each window and may differ. What must
+be the same across windows:
 
-**`PRINT2D` `icv2`:** the 1-based CV index in `tass.inp` is interpreted within
-each window's own CV layout (validated per window: `1 <= icv2 <= ncv` and
-`icv2 != cv1`).
+- **CV1 (umbrella):** every window must restrain the same named CV (for example
+  `phi1`). The local 1-based index of that CV may differ. `iwrap` for that name
+  must also be consistent.
+- **CV_N (`PRINT2D`):** the second surface CV is the same named CV in every
+  window. Again the local index may differ.
 
 ### 3.3 The `tass.inp` control file
+
+Existing control files keep working: a 1-based integer is still accepted
+anywhere a CV is named (see below). No new required keywords.
+
+CVs in `tass.inp` are identified by their **PLUMED labels** (`phi2`, `psi2`,
+…). A 1-based local index is a fallback.
 
 ```text
 <nwin>                              # number of windows (first non-blank line)
@@ -110,31 +123,41 @@ each window's own CV layout (validated per window: `1 <= icv2 <= ncv` and
 # --- repeated nwin times ---
 <folder>                           # folder with plumed.dat, COLVAR (+ HILLS if metad)
 GRIDS_METAD | AUTO_GRIDS_METAD     # metad-grid mode; OMIT for a no-metad window
-  <icv_mtd> <gmin> <gmax> <dgrid>  # GRIDS_METAD only: one line per metad CV
+  <cv_mtd> <gmin> <gmax> <dgrid>   # GRIDS_METAD only: one line per metad CV
 <t_min> <t_max>                    # t_max < 0  ->  use all COLVAR frames
 
 # --- optional, after all windows ---
 PRINT2D [AUTO_GRID]
-  <icv2> [<gmin> <gmax> <dgrid>]   # 2nd CV for the 2D surface (not the restraint CV)
+  <cv_n> [<gmin> <gmax> <dgrid>]   # CV_N: PLUMED name (preferred) or 1-based
+                                   # local index; not the umbrella CV
 ```
 
 Rules:
 
 - `<nwin>` is the first non-blank line. Blank lines and trailing `# ...`
   comments are ignored everywhere.
-- `icv_mtd` and `icv2` are **1-based** CV indices.
-- `GRIDS_METAD` is followed by exactly `ncv_mtd` grid lines (one per CV with
-  `icv_metad == 1`), each `icv_mtd gmin gmax dgrid`.
+- `cv_mtd` on a `GRIDS_METAD` line is the **PLUMED label** of that window's
+  metad CV (preferred), or a 1-based local index. It must be a CV that actually
+  carries `METAD` in that window's `plumed.dat`.
+- The tokens `pi`, `-pi`, and `+pi` are accepted wherever a real is read
+  (`gmin`, `gmax`, `dgrid`).
+- `GRIDS_METAD` is followed by exactly one grid line per metad CV in that
+  window, each `cv_mtd gmin gmax dgrid`.
 - `AUTO_GRIDS_METAD` derives the metad grids from that window's COLVAR; no grid
   lines follow.
 - **No-metad windows:** if a window's `plumed.dat` has no `METAD`, do **not**
   include a metad-grid mode line for it — write only `<folder>` followed by the
   `<t_min> <t_max>` line. The driver knows from `plumed.dat` whether to expect
   the grid-mode line.
-- `PRINT2D` enables the 2D surface; the next line gives `icv2`. With `AUTO_GRID`
-  on the `PRINT2D` line only `icv2` is read (grid auto-computed, pooled over all
-  windows); otherwise supply `icv2 gmin gmax dgrid`. `icv2` must differ from the
-  restraint CV.
+- `PRINT2D` enables the 2D surface `F(CV1, CV_N)`. The next line starts with
+  `cv_n`:
+  - **Preferred:** the PLUMED name (`psi2`). Resolved independently in each
+    window.
+  - **Fallback:** a 1-based local index. That index must map to the **same
+    name** in every window; otherwise the driver stops and asks for the name.
+  - `cv_n` must not be the umbrella CV. With `AUTO_GRID` on the `PRINT2D` line
+    only `cv_n` is read (grid auto-computed, pooled over all windows); otherwise
+    supply `cv_n gmin gmax dgrid`.
 
 **Auto-grid rule** (`AUTO_GRIDS_METAD`, `PRINT2D AUTO_GRID`):
 
@@ -150,14 +173,14 @@ an error instead of inventing a grid.
 `AUTO_GRIDS_METAD` uses the single window's COLVAR; `PRINT2D AUTO_GRID` pools
 over all windows so the 2D grid is common.
 
-**Example** `tass.inp` (a metad window, a no-metad window, and a window with a
-*different* metad CV):
+**Example** `tass.inp` (same umbrella CV `phi1` in every window; different
+transverse metad CVs; 2D surface vs `psi2`):
 
 ```text
 3                 # number of windows
 W1
 GRIDS_METAD
-2 -3.3 -2.8 0.05  # metad on CV 2 (phi2): gmin gmax dgrid
+phi2 -pi pi 0.1   # metad CV by PLUMED label; -pi / pi tokens OK
 1 -1              # t_min=1, t_max=all
 W2
 1 -1              # no metad in W2/plumed.dat -> no grid-mode line
@@ -165,8 +188,12 @@ W3
 AUTO_GRIDS_METAD  # metad on a different CV; grid derived from W3/COLVAR
 1 -1
 PRINT2D AUTO_GRID
-3                 # 2D surface vs CV 3 (psi2), auto grid
+psi2              # CV_N by PLUMED name (legacy: a 1-based local index also works)
 ```
+
+A 1-based local index (`3` instead of `phi2`) still works if that index is the
+same named CV in that window. Prefer the label when indexes differ across
+windows.
 
 ---
 
@@ -211,26 +238,29 @@ w(t) = exp( ( V_bias(t) - c(t) ) / kT ),   kT = kB * TEMP  (the EXTENDED_LAGRANG
 
 For a window **without** a `METAD` action, `V_bias = c(t) = 0`, so `w(t) = 1`
 for every frame; `ct.dat` / `vbias.dat` are neither needed nor read (even with
-`--force`). Steps 1–2 below are skipped for such windows.
+`--force`). Steps 1–2 below are skipped for such windows. For a window **with**
+metadynamics, `V_bias` and `c(t)` are built from **all** of that window's metad
+CVs.
 
 1. **`c(t)`** (`ct.dat`, serial) — well-tempered MetaD time-dependent constant on
    the metad-CV grid; one value per HILLS row (`mtd_steps`).
 2. **`V_bias(s,t)`** (`vbias.dat`, parallel) — bias felt at each MD frame, summed
    over hills deposited up to `mtd_max = (t * w_cv) // w_hill`; one value per
    COLVAR frame (`md_steps`), referenced to frame 1.
-3. **Mean force** at the window's restraint centre `s1_at` (cv1 = restraint CV):
+3. **Mean force** at the window's restraint centre `s1_at` (CV1 = the named
+   umbrella CV):
 
    ```
-   dF1/ds1 = < -kappa_restraint * ( cv1(t) - s1_at ) >_reweighted
-           = Σ_t w(t) [ -k (cv1(t) - s1_at) ] / Σ_t w(t)
+   dF1/ds1 = < -kappa_restraint * ( CV1(t) - s1_at ) >_reweighted
+           = Σ_t w(t) [ -k (CV1(t) - s1_at) ] / Σ_t w(t)
    ```
 
    averaged over `t in [t_min, t_max]`; minimum-image (period `2*pi`) is applied
-   to `cv1(t) - s1_at` when cv1 is `TORSION`.
+   to `CV1(t) - s1_at` when CV1 is `TORSION`.
 
 Then, globally:
 
-4. **`F1(s1)`** — windows are sorted by restraint centre and the mean force is
+4. **`F(CV1)`** — windows are sorted by restraint centre and the mean force is
    integrated with the **trapezoidal rule** over the (possibly non-uniform)
    centres:
 
@@ -240,16 +270,23 @@ Then, globally:
 
    (No `Pu.dat`, no spline fit — the gradient is the restraint mean force.)
 
-5. **`F(cv1, cv2)`** (only if `PRINT2D`) — for each window a reweighted 1D
-   histogram of cv2 over `[t_min, t_max]` gives `P_cond(cv2 | window)`; this is
-   turned into a free energy and offset by that window's `F1`:
+   If CV1 is `TORSION` (`iwrap=1`) **and** the sorted `AT` values cover one full
+   period (`s_last - s_first = 2*pi`, e.g. `-pi` … `+pi`), F1 is closed so
+   `F(+pi) = F(-pi)`. Otherwise the integral is linear.
+
+5. **`F(CV1, CV_N)`** (only if `PRINT2D`) — for each window a reweighted 1D
+   histogram of the named CV_N over `[t_min, t_max]` gives
+   `P_cond(CV_N | window)`; this is turned into a free energy and offset by that
+   window's `F1`:
 
    ```
-   F(cv1, cv2) = -kT ln P_cond(cv2 | window) + F1(cv1)
+   F(CV1, CV_N) = -kT ln P_cond(CV_N | window) + F1(CV1)
    ```
 
-   cv2 is folded into `[gmin2, gmin2 + 2*pi)` when it is `TORSION`; each window
-   contributes one cv1 row at its restraint centre.
+   CV_N is folded into `[gmin2, gmin2 + 2*pi)` when it is `TORSION`. If that grid
+   spans one full period, `-pi` and `+pi` are the **same histogram node** (the
+   `+pi` edge is written as a copy of `-pi`). Each window contributes one CV1
+   row at its restraint centre.
 
 ---
 
@@ -268,7 +305,7 @@ Global (written in the current working directory):
 |------|---------|
 | `mean_force.dat` | `s1   dF1/ds1   F1`  (one row per window, sorted by `s1`) |
 | `fes_1d.dat` | `s1   F1(s1)` |
-| `free_energy_2D.dat` | `cv1   cv2   F(cv1,cv2)   P_cond`  (blank line after each cv1 block) |
+| `free_energy_2D.dat` | `CV1   CV_N   F(CV1,CV_N)   P_cond`  (blank line after each CV1 block) |
 
 Plot (gnuplot):
 
@@ -298,12 +335,15 @@ splot 'free_energy_2D.dat' u 1:2:3 w pm3d      # 2D surface
 | `control file not found` | Wrong `input` path. |
 | `plumed.dat not found for window K` | Folder name in `tass.inp` or `--root` is wrong. |
 | `TASS expects exactly one RESTRAINT CV per window` | Zero or multiple `RESTRAINT` actions in that window's `plumed.dat`. |
-| `icv2=... out of range 1..ncv` / `icv2 cannot be the restraint CV` | `PRINT2D` `icv2` invalid for one window's CV layout. |
+| `umbrella restraint CV names differ across windows` | Every window must restrain the same PLUMED-named CV. |
+| `PRINT2D CV '…' not found in window K` | That name is missing from the window's `plumed.dat`. |
+| `PRINT2D index … maps to different CV names` | The integer fallback is ambiguous; specify CV_N by PLUMED name. |
+| `PRINT2D CV cannot be the restraint CV` | `cv_n` must not be the umbrella CV. |
 | `TEMP not found on the EXTENDED_LAGRANGIAN line` | Add `TEMP=...` to `EXTENDED_LAGRANGIAN` (the TASS temperature). |
 | `!!WARNING: TEMP keyword is missing along with METAD keywords` | Harmless — `METAD` `TEMP` is ignored; TASS uses the `EXTENDED_LAGRANGIAN` `TEMP`. |
 | `expected GRIDS_METAD or AUTO_GRIDS_METAD ...` / wrong `t_min t_max` parse | A metad-grid line was given for a no-metad window, or omitted for a metad window. |
+| `GRIDS_METAD CV '…' not found` / `is not a metadynamics CV` | Label is unknown in that window, or that CV has no `METAD`. |
 | `GRIDS_METAD missing grids for metad CV ...` | Fewer grid lines than metad CVs after `GRIDS_METAD`. |
-| `the 2nd CV (icv2) cannot be the restraint CV` | Choose `icv2 != cv1`. |
 | `two windows share the same restraint centre` | Two windows have identical `AT`. |
 | `HILLS rows (...) != mtd_steps` | HILLS row count must match the number of hills. |
 | `md_steps mismatch ... vbias.dat has ...` | Stale `vbias.dat`; rerun with `--force`. |
@@ -314,8 +354,8 @@ splot 'free_energy_2D.dat' u 1:2:3 w pm3d      # 2D surface
 ## 9. Quick start
 
 ```bash
-# 1. Prepare W1/, W2/, ... each with plumed.dat, COLVAR, HILLS
-# 2. Write tass.inp (Section 3.3)
+# 1. Prepare W1/, W2/, ... each with plumed.dat, COLVAR, and HILLS if metad
+# 2. Write tass.inp (Section 3.3); name CVs with PLUMED labels (phi2, psi2, ...)
 # 3. Run
 python tass_reweight.py tass.inp --nranks 4 --threads 2
 # 4. Plot
