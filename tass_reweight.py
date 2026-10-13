@@ -21,8 +21,9 @@ differ from window to window (each window's ``plumed.dat`` defines its own CV
 layout).  Within a window, ``cv1`` is the 0-based index of the CV carrying the
 umbrella ``RESTRAINT`` (the entry of ``icv_restraint`` equal to 1).  ``icv_metad``
 may also differ: each window can use a different set of metadynamics CVs, or none.
-action needs no HILLS, no ct.dat and no vbias.dat -- its reweighting weight is
-simply 1 for every frame (equivalent to V^bias = 0 and c(t) = 0).
+A window WITHOUT a METAD action needs no HILLS, no ct.dat and no vbias.dat --
+its reweighting weight is simply 1 for every frame (equivalent to V^bias = 0
+and c(t) = 0).
 
 This program computes, for every window:
   1. c(t) factor                ->  ct.dat     (serial, NumPy)
@@ -41,8 +42,12 @@ The reweighted mean force at each window is
 
 with the reweighting weight w(t) = exp( (V^bias(t) - c(t)) / kT ).
 
-Periodic boundary conditions (period 2*pi) are applied to any difference of 
-TORSION-type CVs.
+Periodic boundary conditions (period 2*pi) are applied to any difference of
+TORSION-type CVs (``iwrap=1``).  In ``tass.inp`` the tokens ``pi``, ``-pi``
+and ``+pi`` are accepted wherever a real is read.  If a TORSION grid spans
+one full period, ``-pi`` and ``+pi`` are the same histogram node.  If the
+restraint centres of TORSION windows cover a full period, F1 is closed so
+that F(+pi) = F(-pi).
 
 tass.inp format
 ---------------
@@ -51,11 +56,13 @@ tass.inp format
     <folder>                        # folder with plumed.dat, COLVAR, HILLS
     GRIDS_METAD | AUTO_GRIDS_METAD
       # if GRIDS_METAD: one line per metad CV:  icv_mtd  grid_min  grid_max  dgrid
+      # grid_min / grid_max may be written as -pi / pi
     <t_min> <t_max>                 # t_max < 0  ->  use all COLVAR frames
     # after all windows, optionally:
     PRINT2D [AUTO_GRID]
       <icv2> [grid_min grid_max dgrid]   # 2nd CV for the 2D surface (not the
                                          # restraint CV); grids auto if AUTO_GRID
+                                         # -pi / pi allowed on the grid line
 
 Usage:
     python tass_reweight.py [tass.inp] [--root DIR]
@@ -84,7 +91,8 @@ SCRIPT_PATH = Path(__file__).resolve()   # used to re-exec self for the vbias wo
 # Physical / numerical constants / Settings
 KB = 8.314472e-3        # kJ/(mol*K)
 MIN_PROB = 1.0e-32      # probability floor inside the log
-TWOPI = 2.0 * np.pi     # 2 Pi
+PI = float(np.pi)
+TWOPI = 2.0 * PI        # 2 Pi
 AUTO_NBINS = 50         # auto grids: 50 bins -> 51 points
 
 
@@ -92,8 +100,27 @@ AUTO_NBINS = 50         # auto grids: 50 bins -> 51 points
 #  Generic helpers and reweighting kernels
 # =========================================================================== #
 def _to_float(token: str) -> float:
-    """Parse a Fortran-style real such as '-3.2d0' or '1.0E-3'."""
-    return float(token.replace("d", "e").replace("D", "e"))
+    """Parse a Fortran-style real; also accepts the tokens -pi / pi / +pi."""
+    t = token.strip().lower()
+    if t in ("pi", "+pi"):
+        return PI
+    if t == "-pi":
+        return -PI
+    return float(t.replace("d", "e").replace("D", "e"))
+
+
+def spans_two_pi(gmin: float, gmax: float, dgrid: float) -> bool:
+    """True if [gmin, gmax] is one dihedral period (2*pi) to within ~half a bin."""
+    return abs(gmax - gmin - TWOPI) <= max(0.5 * abs(dgrid), 1.0e-3)
+
+
+def wrap_to_range(x, xmin: float, period: float = TWOPI):
+    """Map x into [xmin, xmin+period).  The upper endpoint folds onto xmin."""
+    xw = np.asarray(x, dtype=np.float64)
+    xw = xw - period * np.floor((xw - xmin) / period)
+    xw = np.where(xw >= xmin + period, xmin, xw)
+    xw = np.where(xw < xmin, xmin, xw)
+    return xw
 
 
 def _nint(x):
@@ -358,6 +385,30 @@ class RestraintInfo:
 
 
 @dataclass
+class WallInfo:
+    """An UPPER_WALLS or LOWER_WALLS half-harmonic (or ^EXP) wall on one CV.
+
+    PLUMED bias contribution of one wall term on CV value x:
+
+        V(x) = KAPPA * ((x - AT + OFFSET) / EPS) ** EXP ,
+
+    active only where the wall bites (x > AT for an upper wall, x < AT for a
+    lower wall; zero otherwise).  The analytic wall force used to correct the
+    measured free-energy gradient is dV/dx (see wall_force_grad).
+    """
+
+    label: str
+    cv_index: int
+    cv_name: str
+    kind: str                # "upper" or "lower"
+    at: float                # AT
+    kappa: float             # KAPPA
+    exp: float = 2.0         # EXP  (PLUMED default 2)
+    eps: float = 1.0         # EPS  (PLUMED default 1)
+    offset: float = 0.0      # OFFSET (PLUMED default 0)
+
+
+@dataclass
 class PlumedInput:
     """Structured result of parsing a ``plumed.dat`` file."""
 
@@ -373,6 +424,8 @@ class PlumedInput:
     icv_metad: List[int] = field(default_factory=list)
     restraints: List[RestraintInfo] = field(default_factory=list)
     icv_restraint: List[int] = field(default_factory=list)
+    walls: List[WallInfo] = field(default_factory=list)
+    icv_wall: List[int] = field(default_factory=list)
     w_cv: Optional[int] = None
     colvar_print_args: List[str] = field(default_factory=list)
 
@@ -438,6 +491,8 @@ _PLUMED_ACTION_KEYWORDS = {
     "METAD",
     "METADYNAMICS",
     "RESTRAINT",
+    "UPPER_WALLS",
+    "LOWER_WALLS",
     "PRINT",
 }
 
@@ -483,6 +538,7 @@ def parse_plumed_dat(path: str) -> PlumedInput:
     extended_temp: Optional[float] = None
     metad_list: List[MetadInfo] = []
     restraints: List[RestraintInfo] = []
+    walls: List[WallInfo] = []
     w_cv: Optional[int] = None
     colvar_print_args: List[str] = []
 
@@ -622,6 +678,44 @@ def parse_plumed_dat(path: str) -> PlumedInput:
                     )
                 )
 
+        elif action in ("UPPER_WALLS", "LOWER_WALLS"):
+            kind = "upper" if action == "UPPER_WALLS" else "lower"
+            if "ARG" not in kwargs:
+                raise ValueError(f"{action} line is missing ARG=")
+            args = _plumed_split_list(kwargs["ARG"])
+            if "AT" not in kwargs:
+                raise ValueError(f"{action} line is missing AT=")
+            if "KAPPA" not in kwargs:
+                raise ValueError(f"{action} line is missing KAPPA=")
+            at_vals = [float(v) for v in _plumed_split_list(kwargs["AT"])]
+            kappa_vals = [float(v) for v in _plumed_split_list(kwargs["KAPPA"])]
+            exp_vals = ([float(v) for v in _plumed_split_list(kwargs["EXP"])]
+                        if "EXP" in kwargs else [2.0])
+            eps_vals = ([float(v) for v in _plumed_split_list(kwargs["EPS"])]
+                        if "EPS" in kwargs else [1.0])
+            off_vals = ([float(v) for v in _plumed_split_list(kwargs["OFFSET"])]
+                        if "OFFSET" in kwargs else [0.0])
+
+            def _pick(vals, j):
+                """PLUMED broadcasts a single value to all ARGs."""
+                return vals[j] if j < len(vals) else vals[-1]
+
+            for j, arg in enumerate(args):
+                idx = resolve_cv(arg)
+                walls.append(
+                    WallInfo(
+                        label=label or action.lower(),
+                        cv_index=idx,
+                        cv_name=cv_names[idx],
+                        kind=kind,
+                        at=_pick(at_vals, j),
+                        kappa=_pick(kappa_vals, j),
+                        exp=_pick(exp_vals, j),
+                        eps=_pick(eps_vals, j),
+                        offset=_pick(off_vals, j),
+                    )
+                )
+
         elif action == "PRINT":
             if kwargs.get("FILE", "").upper() == "COLVAR":
                 if "STRIDE" not in kwargs:
@@ -641,6 +735,10 @@ def parse_plumed_dat(path: str) -> PlumedInput:
     for r in restraints:
         icv_restraint[r.cv_index] = 1
 
+    icv_wall = [0] * ncv
+    for w in walls:
+        icv_wall[w.cv_index] = 1
+
     return PlumedInput(
         ncv=ncv,
         cv_names=cv_names,
@@ -654,6 +752,8 @@ def parse_plumed_dat(path: str) -> PlumedInput:
         icv_metad=icv_metad,
         restraints=restraints,
         icv_restraint=icv_restraint,
+        walls=walls,
+        icv_wall=icv_wall,
         w_cv=w_cv,
         colvar_print_args=colvar_print_args,
     )
@@ -775,6 +875,7 @@ def parse_tass(text: str, root: Path) -> dict:
             biasfactor=biasfactor, temp=temp, kappa_restraint=kappa_restraint,
             restraint_at=restraint_at, has_metad=has_metad, midx=midx,
             auto_metad=auto_metad, metad_grids=metad_grids,
+            walls=list(plumed.walls), icv_wall=list(plumed.icv_wall),
             plumed_path=str(plumed_path),
         ))
 
@@ -832,6 +933,13 @@ def _report_tass_input(inp_path: Path, root: Path, cfg: dict) -> None:
               f"icv_restraint={win['icv_restraint']}")
         print(f"    RESTRAINT  : kappa={win['kappa_restraint']:.4g}  "
               f"AT={win['restraint_at']:.6g}")
+        if win.get("walls"):
+            for w in win["walls"]:
+                print(f"    {w.kind.upper():5s} WALL: CV {w.cv_index + 1} "
+                      f"({w.cv_name})  AT={w.at:.6g}  KAPPA={w.kappa:.4g}  "
+                      f"EXP={w.exp:.4g}  EPS={w.eps:.4g}  OFFSET={w.offset:.4g}")
+        else:
+            print("    WALLS      : (none)")
         print(f"    EXTENDED   : TEMP={win['temp']:.4g}  "
               f"w_cv(STRIDE)={win['w_cv']}")
         if win["has_metad"]:
@@ -1117,16 +1225,62 @@ def integrate_mean_force(s1: np.ndarray, dfds: np.ndarray) -> np.ndarray:
     return fes1
 
 
+def _restraint_cv_is_torsion(windows: list[dict]) -> bool:
+    """True only if every window's restraint CV (cv1) is TORSION (iwrap=1)."""
+    return all(bool(w["iwrap"][w["cv1"]]) for w in windows)
+
+
+def _centres_cover_full_period(s1: np.ndarray) -> bool:
+    """True if linearly sorted restraint centres span one 2*pi period.
+
+    After sorting, the first and last centres are the same seam
+    (e.g. -pi and +pi) when (s_last - s_first) is 2*pi.
+    """
+    if s1.size < 2:
+        return False
+    ds = float(s1[-1] - s1[0])
+    typical = float(np.median(np.diff(s1))) if s1.size > 2 else abs(ds)
+    return abs(ds - TWOPI) <= max(0.5 * abs(typical), 1.0e-3)
+
+
+def integrate_mean_force_periodic(s1: np.ndarray, dfds: np.ndarray):
+    """Trapezoidal F1 on a TORSION whose first/last centres are the same seam.
+
+    ``s1`` is strictly increasing and covers one period: s1[-1] = s1[0] + 2*pi
+    (e.g. -pi ... +pi).  The seam mean force is the average of the two end
+    windows.  F is closed so F(+pi) = F(-pi) = 0.
+
+    Returns (fes1, residual) where residual is the raw wrap-around integral
+    before forcing the close (ideally ~0 for a conservative force).
+    """
+    f_seam = 0.5 * (dfds[0] + dfds[-1])
+    s_int = np.concatenate([s1[:-1], [s1[0] + TWOPI]])
+    f_int = np.concatenate([[f_seam], dfds[1:-1], [f_seam]])
+    fes_int = integrate_mean_force(s_int, f_int)
+    residual = float(fes_int[-1])
+    fes1 = np.concatenate([fes_int[:-1], [0.0]])
+    return fes1, residual
+
+
 # =========================================================================== #
 #  Step 5: 2D free energy  F(cv1, cv2)
 # =========================================================================== #
 def _bin_index(values: np.ndarray, gmin: float, dgrid: float,
-               periodic: bool) -> np.ndarray:
-    """1-based bin index; periodic CVs are folded into [gmin, gmin+2*pi)."""
-    d = values - gmin
+               periodic: bool, n_unique: int | None = None) -> np.ndarray:
+    """0-based bin index.
+
+    For a TORSION (``periodic``) whose grid spans 2*pi, ``n_unique`` is the
+    number of distinct nodes: +pi is folded onto the -pi bin (index 0).
+    Otherwise values are folded into [gmin, gmin+2*pi) when periodic.
+    """
     if periodic:
-        d = d - TWOPI * np.floor(d / TWOPI)
-    return (_nint(d / dgrid) + 1).astype(int)
+        xw = wrap_to_range(values, gmin, TWOPI)
+    else:
+        xw = np.asarray(values, dtype=np.float64)
+    j = _nint((xw - gmin) / dgrid).astype(int)
+    if periodic and n_unique is not None:
+        j = np.mod(j, n_unique)
+    return j
 
 
 def compute_fes_2d(cfg: dict, root: Path, order: list[int], s1_grid: np.ndarray,
@@ -1138,7 +1292,15 @@ def compute_fes_2d(cfg: dict, root: Path, order: list[int], s1_grid: np.ndarray,
     ngrid2 = nbins_from_grid(gmin2, gmax2, dg2)
     ngrid1 = len(order)
 
-    prob = np.zeros((ngrid1, ngrid2))
+    any_torsion2 = any(bool(cfg["windows"][iw]["iwrap"][icv2 - 1]) for iw in order)
+    wrap2_full = any_torsion2 and spans_two_pi(gmin2, gmax2, dg2)
+    n_unique2 = (ngrid2 - 1) if wrap2_full else ngrid2
+    if wrap2_full:
+        print(" (Info) cv2 is TORSION and the grid spans 2*pi: "
+              "-pi and +pi are the same bin")
+
+    # Accumulate on the unique nodes only; the +pi edge is a copy at write time.
+    prob = np.zeros((ngrid1, n_unique2))
     norm = np.zeros(ngrid1)
 
     for row, iw in enumerate(order):
@@ -1159,16 +1321,20 @@ def compute_fes_2d(cfg: dict, root: Path, order: list[int], s1_grid: np.ndarray,
         t_max = md_steps if win["t_max"] < 0 else win["t_max"]
         i_md = np.arange(1, md_steps + 1)
         cv2 = colvar[:, cv2_col]
-        jbin = _bin_index(cv2, gmin2, dg2, periodic2)
+        n_u = n_unique2 if (periodic2 and wrap2_full) else None
+        jbin = _bin_index(cv2, gmin2, dg2, periodic2, n_unique=n_u)
 
-        ok_jbin = (jbin >= 1) & (jbin <= ngrid2 - 1)
+        if periodic2 and wrap2_full:
+            ok_jbin = (jbin >= 0) & (jbin < n_unique2)
+        else:
+            ok_jbin = (jbin >= 0) & (jbin <= ngrid2 - 2)
         ok_time = (i_md >= win["t_min"]) & (i_md <= t_max)
         mask = ok_jbin & ok_time
 
         if np.any(mask):
             sel = np.where(mask)[0]
             weight = _reweight_weights(folder, win, i_md[sel], md_steps)
-            np.add.at(prob[row], jbin[sel] - 1, weight)
+            np.add.at(prob[row], jbin[sel], weight)
             norm[row] += float(weight.sum())
 
     print(" (Info) 2D probability is computed.")
@@ -1182,7 +1348,8 @@ def compute_fes_2d(cfg: dict, root: Path, order: list[int], s1_grid: np.ndarray,
     with (Path.cwd() / "free_energy_2D.dat").open("w") as fh:
         for ibin in range(ngrid1):
             for jbin in range(ngrid2):
-                p_cond = prob[ibin, jbin] * inv_norm[ibin]
+                ju = (jbin % n_unique2) if wrap2_full else min(jbin, n_unique2 - 1)
+                p_cond = prob[ibin, ju] * inv_norm[ibin]
                 fe = -kt0 * np.log(max(p_cond, MIN_PROB)) + fes1[ibin]
                 fh.write(f"{s1_grid[ibin]:16.8E}{s2_grid[jbin]:16.8E}"
                          f"{fe:16.8E}{p_cond:16.8E}\n")
@@ -1314,7 +1481,20 @@ def main(argv: list[str] | None = None) -> int:
     if np.any(np.diff(s1_grid) <= 0.0):
         sys.exit("!!ERROR: two windows share the same restraint centre; "
                  "cannot integrate the mean force")
-    fes1 = integrate_mean_force(s1_grid, dfds)
+
+    wrap_1d = (_restraint_cv_is_torsion(cfg["windows"])
+               and _centres_cover_full_period(s1_grid))
+    if wrap_1d:
+        fes1, residual = integrate_mean_force_periodic(s1_grid, dfds)
+        print(" (Info) restraint CV is TORSION and AT values span 2*pi: "
+              "F(+pi) = F(-pi)  (periodic stitch)")
+        print(f" (Info) periodic trapezoid residual F(+pi)-F(-pi) before "
+              f"closing = {residual:.6e}")
+    else:
+        fes1 = integrate_mean_force(s1_grid, dfds)
+        if _restraint_cv_is_torsion(cfg["windows"]):
+            print(" (Info) restraint CV is TORSION but AT values do not span "
+                  "2*pi: F1 integrated linearly")
 
     with (Path.cwd() / "mean_force.dat").open("w") as fh:
         fh.write("#       s1            dF1/ds1            F1\n")
