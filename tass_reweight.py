@@ -16,11 +16,13 @@ The simulation parameters are read directly from each window's ``plumed.dat``
   * KAPPA / AT of the RESTRAINT, PACE (w_hill) and BIASFACTOR of the METAD,
     the TEMP of the EXTENDED_LAGRANGIAN line, and the COLVAR print STRIDE (w_cv)
 
-``ncv``, ``iwrap``, ``icv_restraint`` and the restraint CV index ``cv1`` may all
-differ from window to window (each window's ``plumed.dat`` defines its own CV
-layout).  Within a window, ``cv1`` is the 0-based index of the CV carrying the
-umbrella ``RESTRAINT`` (the entry of ``icv_restraint`` equal to 1).  ``icv_metad``
-may also differ: each window can use a different set of metadynamics CVs, or none.
+Each window may have a different number of CVs and different local indexes.
+The umbrella CV is identified by its **PLUMED name** (e.g. ``phi1``): every
+window must restrain the same named CV, even if its index differs.  Orthogonal
+metadynamics CVs may differ per window (or be absent).  ``PRINT2D`` takes the
+name of CV_N (or a legacy 1-based local index); that name is resolved per
+window.  Reweighting (``c(t)``, ``V_bias``) always uses **all** metad CVs
+defined in that window's ``plumed.dat``.
 A window WITHOUT a METAD action needs no HILLS, no ct.dat and no vbias.dat --
 its reweighting weight is simply 1 for every frame (equivalent to V^bias = 0
 and c(t) = 0).
@@ -55,13 +57,14 @@ tass.inp format
     # then, for each window:
     <folder>                        # folder with plumed.dat, COLVAR, HILLS
     GRIDS_METAD | AUTO_GRIDS_METAD
-      # if GRIDS_METAD: one line per metad CV:  icv_mtd  grid_min  grid_max  dgrid
+      # if GRIDS_METAD: one line per metad CV:  cv_mtd  grid_min  grid_max  dgrid
+      # cv_mtd = PLUMED name (preferred) or 1-based local index
       # grid_min / grid_max may be written as -pi / pi
     <t_min> <t_max>                 # t_max < 0  ->  use all COLVAR frames
     # after all windows, optionally:
     PRINT2D [AUTO_GRID]
-      <icv2> [grid_min grid_max dgrid]   # 2nd CV for the 2D surface (not the
-                                         # restraint CV); grids auto if AUTO_GRID
+      <cv_n> [grid_min grid_max dgrid]   # CV_N by PLUMED name (preferred) or
+                                         # 1-based local index; not the umbrella CV
                                          # -pi / pi allowed on the grid line
 
 Usage:
@@ -801,6 +804,27 @@ def _metad_params(plumed):
     return w_hills.pop(), bf
 
 
+def _resolve_cv_token(token: str, cv_names: list[str], *, where: str,
+                      iw: int) -> int:
+    """Map a PLUMED label or 1-based local index to a 0-based CV index."""
+    ncv = len(cv_names)
+    try:
+        icv1b = int(token)
+    except ValueError:
+        if token not in cv_names:
+            sys.exit(
+                f"!!ERROR: {where} CV '{token}' not found in window {iw} "
+                f"(known: {cv_names})"
+            )
+        return cv_names.index(token)
+    if not (1 <= icv1b <= ncv):
+        sys.exit(
+            f"!!ERROR: {where} index {icv1b} out of range 1..ncv ({ncv}) "
+            f"for window {iw}"
+        )
+    return icv1b - 1
+
+
 def parse_tass(text: str, root: Path) -> dict:
     """Read tass.inp + each window's plumed.dat into one config dict."""
     rdr = InputReader(text)
@@ -846,20 +870,35 @@ def parse_tass(text: str, root: Path) -> dict:
             ncv_mtd = len(midx)
             if mode == "GRIDS_METAD":
                 metad_grids = {}
+                names = list(plumed.cv_names)
+                metad_names = [names[i] for i in midx]
                 for _ in range(ncv_mtd):
                     tk = rdr.tokens(f"metad grid (window {iw + 1})")
                     if len(tk) < 4:
                         sys.exit(f"!!ERROR: GRIDS_METAD line needs "
-                                 f"'icv_mtd gmin gmax dgrid' (window {iw + 1})")
-                    icv1b = int(tk[0])
+                                 f"'cv_mtd gmin gmax dgrid' (window {iw + 1}; "
+                                 f"cv_mtd = PLUMED name or 1-based index)")
+                    idx = _resolve_cv_token(
+                        tk[0], names, where="GRIDS_METAD", iw=iw + 1,
+                    )
+                    if idx not in midx:
+                        sys.exit(
+                            f"!!ERROR: GRIDS_METAD CV '{tk[0]}' is not a "
+                            f"metadynamics CV in window {iw + 1} "
+                            f"(metad CVs: {metad_names})"
+                        )
+                    if idx in metad_grids:
+                        sys.exit(
+                            f"!!ERROR: GRIDS_METAD grid for CV '{names[idx]}' "
+                            f"given twice in window {iw + 1}"
+                        )
                     gmin, gmax, dg = (_to_float(tk[1]), _to_float(tk[2]),
                                       _to_float(tk[3]))
-                    metad_grids[icv1b - 1] = (gmin, gmax, dg)
-                missing = [i for i in midx if i not in metad_grids]
+                    metad_grids[idx] = (gmin, gmax, dg)
+                missing = [names[i] for i in midx if i not in metad_grids]
                 if missing:
                     sys.exit(f"!!ERROR: GRIDS_METAD missing grids for metad CV "
-                             f"indices (1-based) {[i + 1 for i in missing]} "
-                             f"in window {iw + 1}")
+                             f"{missing} in window {iw + 1}")
             elif mode == "AUTO_GRIDS_METAD":
                 auto_metad = True
             else:
@@ -871,7 +910,8 @@ def parse_tass(text: str, root: Path) -> dict:
         windows.append(dict(
             folder=folder, ncv=ncv, cv_names=list(plumed.cv_names),
             iwrap=iwrap, icv_restraint=icv_restraint,
-            cv1=cv1, t_min=t_min, t_max=t_max, w_cv=w_cv, w_hill=w_hill,
+            cv1=cv1, cv1_name=plumed.cv_names[cv1],
+            t_min=t_min, t_max=t_max, w_cv=w_cv, w_hill=w_hill,
             biasfactor=biasfactor, temp=temp, kappa_restraint=kappa_restraint,
             restraint_at=restraint_at, has_metad=has_metad, midx=midx,
             auto_metad=auto_metad, metad_grids=metad_grids,
@@ -879,34 +919,86 @@ def parse_tass(text: str, root: Path) -> dict:
             plumed_path=str(plumed_path),
         ))
 
+    cv1_name = _require_same_umbrella_cv(windows)
+
     # --- optional PRINT2D section (after all windows) -------------------- #
     print_2d = False
     auto2 = False
-    icv2 = None
+    cv_n_name = None
     grid2 = None
     marker = rdr.raw_line()
     if marker is not None and "PRINT2D" in marker.upper():
         print_2d = True
         auto2 = "AUTO_GRID" in marker.upper()
-        tk = rdr.tokens("PRINT2D grid line (icv2 [gmin gmax dgrid])")
-        icv2 = int(tk[0])                          # 1-based CV index (per window)
-        for iw, win in enumerate(windows, start=1):
-            if not (1 <= icv2 <= win["ncv"]):
-                sys.exit(f"!!ERROR: icv2={icv2} out of range 1..ncv "
-                         f"({win['ncv']}) for window {iw}")
-            if icv2 - 1 == win["cv1"]:
-                sys.exit(f"!!ERROR: icv2 cannot be the restraint CV (cv1) "
-                         f"in window {iw}")
+        tk = rdr.tokens("PRINT2D grid line (cv_n [gmin gmax dgrid])")
+        cv_n_name = _resolve_print2d_cv(windows, tk[0])
         if not auto2:
             if len(tk) < 4:
                 sys.exit("!!ERROR: PRINT2D without AUTO_GRID needs "
-                         "'icv2 gmin gmax dgrid'")
+                         "'cv_n gmin gmax dgrid' (cv_n = PLUMED name or "
+                         "1-based local index)")
             grid2 = (_to_float(tk[1]), _to_float(tk[2]), _to_float(tk[3]))
 
     return dict(
-        nwin=nwin,
-        windows=windows, print_2d=print_2d, auto2=auto2, icv2=icv2, grid2=grid2,
+        nwin=nwin, cv1_name=cv1_name, cv_n_name=cv_n_name,
+        windows=windows, print_2d=print_2d, auto2=auto2, grid2=grid2,
     )
+
+
+def _require_same_umbrella_cv(windows: list[dict]) -> str:
+    """Require every window to restrain the same PLUMED-named CV (CV1)."""
+    names = [w["cv1_name"] for w in windows]
+    if len(set(names)) != 1:
+        detail = ", ".join(f"window {i + 1}:{n}" for i, n in enumerate(names))
+        sys.exit(
+            "!!ERROR: umbrella restraint CV names differ across windows "
+            f"({detail}). All windows must restrain the same CV (by PLUMED "
+            "name); local indexes may differ."
+        )
+    iwraps = [int(w["iwrap"][w["cv1"]]) for w in windows]
+    if len(set(iwraps)) != 1:
+        sys.exit(
+            f"!!ERROR: iwrap for umbrella CV '{names[0]}' is inconsistent "
+            f"across windows: {iwraps}"
+        )
+    return names[0]
+
+
+def _resolve_print2d_cv(windows: list[dict], token: str) -> str:
+    """Map PRINT2D token (PLUMED name or 1-based index) to a common CV name.
+
+    Stores the local 0-based index as ``win['cv_n']`` on every window.
+    """
+    names = []
+    for iw, win in enumerate(windows, start=1):
+        idx = _resolve_cv_token(token, win["cv_names"], where="PRINT2D", iw=iw)
+        if idx == win["cv1"]:
+            sys.exit(
+                f"!!ERROR: PRINT2D CV '{win['cv_names'][idx]}' is the "
+                f"restraint CV in window {iw}"
+            )
+        win["cv_n"] = idx
+        names.append(win["cv_names"][idx])
+    try:
+        int(token)
+        by_index = True
+    except ValueError:
+        by_index = False
+    if by_index and len(set(names)) != 1:
+        detail = ", ".join(f"window {i + 1}:{n}" for i, n in enumerate(names))
+        sys.exit(
+            f"!!ERROR: PRINT2D index {token} maps to different CV names "
+            f"({detail}). Specify the CV by PLUMED name instead."
+        )
+    cv_n_name = names[0]
+
+    iwraps = [int(w["iwrap"][w["cv_n"]]) for w in windows]
+    if len(set(iwraps)) != 1:
+        sys.exit(
+            f"!!ERROR: iwrap for PRINT2D CV '{cv_n_name}' is inconsistent "
+            f"across windows: {iwraps}"
+        )
+    return cv_n_name
 
 
 def _report_tass_input(inp_path: Path, root: Path, cfg: dict) -> None:
@@ -943,14 +1035,15 @@ def _report_tass_input(inp_path: Path, root: Path, cfg: dict) -> None:
         print(f"    EXTENDED   : TEMP={win['temp']:.4g}  "
               f"w_cv(STRIDE)={win['w_cv']}")
         if win["has_metad"]:
-            print(f"    METAD      : CVs (1-based)={[i + 1 for i in win['midx']]}  "
+            mnames = [win["cv_names"][i] for i in win["midx"]]
+            print(f"    METAD      : CVs={mnames}  "
                   f"PACE={win['w_hill']}  BIASFACTOR={win['biasfactor']:.4g}")
             if win["auto_metad"]:
                 print("    metad grid : AUTO_GRIDS_METAD (from COLVAR at run time)")
             else:
                 for icv, (gmin, gmax, dg) in sorted(win["metad_grids"].items()):
                     nb = nbins_from_grid(gmin, gmax, dg)
-                    print(f"    metad grid : CV {icv + 1}  "
+                    print(f"    metad grid : {win['cv_names'][icv]}  "
                           f"gmin={gmin:.6g}  gmax={gmax:.6g}  "
                           f"dgrid={dg:.6g}  nbin={nb}")
         else:
@@ -963,8 +1056,13 @@ def _report_tass_input(inp_path: Path, root: Path, cfg: dict) -> None:
     if cfg["print_2d"]:
         print("-" * 70)
         print("PRINT2D (global)")
-        print(f"  enabled      : yes")
-        print(f"  icv2         : {cfg['icv2']} (1-based, per-window CV index)")
+        print("  enabled      : yes")
+        print(f"  CV_N         : {cfg['cv_n_name']}  (identified by PLUMED name)")
+        local = ", ".join(
+            f"window {i + 1}: index {w['cv_n'] + 1}"
+            for i, w in enumerate(cfg["windows"])
+        )
+        print(f"  local index  : {local}")
         if cfg["auto2"]:
             print("  grid         : AUTO_GRID (from pooled COLVAR at run time)")
         else:
@@ -1285,19 +1383,18 @@ def _bin_index(values: np.ndarray, gmin: float, dgrid: float,
 
 def compute_fes_2d(cfg: dict, root: Path, order: list[int], s1_grid: np.ndarray,
                    fes1: np.ndarray, grid2: tuple) -> None:
-    """Stitch a 2D surface F(cv1, cv2): one cv1 row per window (sorted)."""
-    icv2 = cfg["icv2"]                             # 1-based CV index (per window)
-    cv2_col = icv2                                 # COLVAR col == 1-based CV index
+    """Stitch a 2D surface F(CV1, CV_N): one CV1 row per window (sorted)."""
     gmin2, gmax2, dg2 = grid2
     ngrid2 = nbins_from_grid(gmin2, gmax2, dg2)
     ngrid1 = len(order)
 
-    any_torsion2 = any(bool(cfg["windows"][iw]["iwrap"][icv2 - 1]) for iw in order)
+    any_torsion2 = any(bool(cfg["windows"][iw]["iwrap"][cfg["windows"][iw]["cv_n"]])
+                       for iw in order)
     wrap2_full = any_torsion2 and spans_two_pi(gmin2, gmax2, dg2)
     n_unique2 = (ngrid2 - 1) if wrap2_full else ngrid2
     if wrap2_full:
-        print(" (Info) cv2 is TORSION and the grid spans 2*pi: "
-              "-pi and +pi are the same bin")
+        print(f" (Info) CV_N '{cfg['cv_n_name']}' is TORSION and the grid "
+              "spans 2*pi: -pi and +pi are the same bin")
 
     # Accumulate on the unique nodes only; the +pi edge is a copy at write time.
     prob = np.zeros((ngrid1, n_unique2))
@@ -1306,7 +1403,7 @@ def compute_fes_2d(cfg: dict, root: Path, order: list[int], s1_grid: np.ndarray,
     for row, iw in enumerate(order):
         win = cfg["windows"][iw]
         folder = root / win["folder"]
-        periodic2 = bool(win["iwrap"][icv2 - 1])
+        periodic2 = bool(win["iwrap"][win["cv_n"]])
         colvar = load_table(folder / "COLVAR", f"COLVAR (window {iw + 1})",
                             min_cols=win["ncv"] + 1)
 
@@ -1320,7 +1417,7 @@ def compute_fes_2d(cfg: dict, root: Path, order: list[int], s1_grid: np.ndarray,
 
         t_max = md_steps if win["t_max"] < 0 else win["t_max"]
         i_md = np.arange(1, md_steps + 1)
-        cv2 = colvar[:, cv2_col]
+        cv2 = colvar[:, win["cv_n"] + 1]
         n_u = n_unique2 if (periodic2 and wrap2_full) else None
         jbin = _bin_index(cv2, gmin2, dg2, periodic2, n_unique=n_u)
 
@@ -1510,15 +1607,15 @@ def main(argv: list[str] | None = None) -> int:
         print("=" * 70)
         print("Computing 2D free energy surface ...")
         if cfg["auto2"]:
-            icv2 = cfg["icv2"]
+            name = cfg["cv_n_name"]
             pooled = []
             for win in cfg["windows"]:
                 folder = root / win["folder"]
                 pooled.append(np.loadtxt(folder / "COLVAR", comments="#",
-                                         usecols=(icv2,), ndmin=1))
+                                         usecols=(win["cv_n"] + 1,), ndmin=1))
             grid2 = _auto_grid(np.concatenate(pooled),
-                               label=f"CV {icv2} (PRINT2D AUTO_GRID)")
-            print(f"  AUTO_GRID for CV {icv2}: gmin={grid2[0]:.4f} "
+                               label=f"{name} (PRINT2D AUTO_GRID)")
+            print(f"  AUTO_GRID for {name}: gmin={grid2[0]:.4f} "
                   f"gmax={grid2[1]:.4f} dgrid={grid2[2]:.4f}")
         else:
             grid2 = cfg["grid2"]
